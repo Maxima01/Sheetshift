@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local main window: native file picker and core window events. File opening is validated in Rust.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}
+

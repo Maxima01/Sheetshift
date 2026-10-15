@@ -1,0 +1,19 @@
+[package]
+name = "sheetshift-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Local document-to-Excel conversion from the command line"
+
+[[bin]]
+name = "sheetshift"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sheetshift-core = { path = "../core" }
+
+[dev-dependencies]
+tempfile = "3"

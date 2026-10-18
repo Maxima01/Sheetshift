@@ -12,7 +12,7 @@ Both interfaces use the same Rust conversion engine, settings, terms acceptance,
 - Conversion history with source/output paths, timestamps, outcomes, row counts, and errors. The latest 1,000 attempts are retained.
 - Versioned terms acceptance enforced by the Rust engine in both desktop and CLI.
 - Light and dark appearance that follows the operating system, including changes while the app is open.
-- CLI batch JSON output and a nonzero exit code when any conversion fails.
+- Interactive terminal CLI with a main menu, fuzzy file picker, progress bars, and result tables; batch JSON output and a nonzero exit code when any conversion fails.
 
 ## Supported conversion behavior
 
@@ -68,6 +68,8 @@ sheetshift terms --accept
 
 `cargo install --path` installs `sheetshift` in Cargo's binary directory. Alternatively, run `target/release/sheetshift` (`sheetshift.exe` on Windows), or use `cargo run -p sheetshift-cli -- ...`. See [Cargo's install documentation](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 
+On an interactive terminal, a bare `sheetshift` opens a menu (convert, history, settings, terms, formats) and `sheetshift convert` with no file arguments opens a fuzzy multi-select picker for the current folder. Interactive batches show animated progress and finish with a result table. Prompts and progress are skipped when the command is piped, run in CI, or given `--json`, so scripts keep the plain-text and JSON behavior below. Press Ctrl-C to cancel; interrupted sessions exit with code `130`. Add `--verbose` to print extra diagnostics on stderr.
+
 Convert one file or a batch:
 
 ```sh
@@ -84,7 +86,7 @@ For a noninteractive workflow, read the terms first, then explicitly supply acce
 sheetshift convert notes.docx --output ./workbooks --accept-terms --json
 ```
 
-The JSON response contains `succeeded`, `failed`, and `results`. A conversion result contains `status` (`success` or `failed`) and any `warnings`. A rejected request can contain only `input_path`, `status`, and `error`. A mixed-success batch continues processing remaining inputs and exits with code `1`. Invalid command syntax exits with code `2`. Fatal initialization errors are printed to stderr and exit with code `1`; JSON stdout is never mixed with progress messages.
+The JSON response contains `succeeded`, `failed`, and `results`. A conversion result contains `status` (`success` or `failed`) and any `warnings`. A rejected request can contain only `input_path`, `status`, and `error`. A mixed-success batch continues processing remaining inputs and exits with code `1`. Invalid command usage (including `history --yes` without `--clear`, or a bare invocation outside a terminal) exits with code `2`. Fatal initialization errors are printed to stderr and exit with code `1`; JSON stdout is never mixed with prompts or progress messages.
 
 Manage shared preferences and history:
 
@@ -125,7 +127,7 @@ cargo clippy -p sheetshift-core -p sheetshift-cli -- -D warnings
 cargo check -p sheetshift-desktop
 ```
 
-The desktop check requires the platform prerequisites above. Core and CLI checks can run without a WebView. CLI integration tests use temporary directories and cover terms gating, clean JSON, mixed batch failures, persistence across processes, history preferences, and clearing history without deleting files. The frontend build checks TypeScript and production asset generation; it does not replace native UI testing.
+The desktop check requires the platform prerequisites above. Core and CLI checks can run without a WebView. CLI integration tests use temporary directories and cover terms gating, clean JSON, mixed batch failures, persistence across processes, history preferences, clearing history without deleting files, and non-interactive usage errors (bare invocation, missing file arguments, and incomplete flags). The frontend build checks TypeScript and production asset generation; it does not replace native UI testing.
 
 ## Codebase documentation
 

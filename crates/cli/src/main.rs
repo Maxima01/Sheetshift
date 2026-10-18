@@ -1,17 +1,32 @@
-use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
-use sheetshift_core::{
-    default_data_dir, supported_formats, ConversionRequest, HistoryEntry, Settings, Store,
-    TERMS_VERSION,
-};
-use std::{io::Write, path::PathBuf, process::ExitCode};
+use anyhow::{Context, Result};
+use clap::{CommandFactory, Parser, Subcommand};
+use sheetshift_core::{default_data_dir, Store};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-const TERMS: &str = include_str!("../../../docs/TERMS.md");
+mod commands;
+mod progress;
+mod prompts;
+mod ui;
+
+use commands::{ConvertArgs, FormatsArgs, HistoryArgs, SettingsCommand, TermsArgs};
+
+const EXIT_USAGE: u8 = 2;
+const EXIT_INTERRUPTED: u8 = 130;
+
+const EXAMPLES: &str = "\
+Examples:
+  sheetshift                              Open the interactive menu
+  sheetshift convert                      Pick files with fuzzy search
+  sheetshift convert a.docx -o ./books    Convert with animated progress
+  sheetshift history                      Styled history table
+  sheetshift history --json               Machine-readable history
+";
 
 /// Convert document text and spreadsheet data into Excel workbooks on your device.
 #[derive(Debug, Parser)]
-#[command(name = "sheetshift", version, about, arg_required_else_help = true)]
+#[command(name = "sheetshift", version, about, after_help = EXAMPLES)]
 struct Cli {
     /// Directory containing sheetshift.sqlite3. Defaults to the shared desktop data directory.
     #[arg(long, global = true, value_name = "DIR")]
@@ -21,8 +36,12 @@ struct Cli {
     #[arg(long, global = true)]
     accept_terms: bool,
 
+    /// Print extra diagnostics on stderr.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -37,333 +56,167 @@ enum Command {
         command: Option<SettingsCommand>,
     },
     /// Print the terms and conditions, or accept the current version.
-    Terms {
-        #[arg(long)]
-        accept: bool,
-    },
+    Terms(TermsArgs),
     /// List supported input extensions.
-    Formats {
-        #[arg(long)]
-        json: bool,
-    },
+    Formats(FormatsArgs),
 }
 
-#[derive(Debug, Args)]
-struct ConvertArgs {
-    #[arg(required = true, value_name = "FILE", num_args = 1..)]
-    files: Vec<PathBuf>,
-
-    /// Output folder. Defaults to the saved preference, then ./converted.
-    #[arg(short, long, value_name = "DIR")]
-    output: Option<PathBuf>,
-
-    /// Write a single JSON object to stdout; errors still cause a nonzero exit.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct HistoryArgs {
-    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
-    limit: u32,
-    #[arg(long)]
-    json: bool,
-    /// Delete all stored history entries, leaving files and settings intact.
-    #[arg(long, requires = "yes")]
-    clear: bool,
-    /// Required acknowledgement for --clear.
-    #[arg(long, requires = "clear")]
-    yes: bool,
-}
-
-#[derive(Debug, Subcommand)]
-enum SettingsCommand {
-    /// Print the current settings as JSON.
-    View,
-    /// Set the default output folder, or remove the preference with --reset.
-    OutputDir {
-        #[arg(
-            value_name = "DIR",
-            required_unless_present = "reset",
-            conflicts_with = "reset"
-        )]
-        directory: Option<PathBuf>,
-        #[arg(long)]
-        reset: bool,
-    },
-    /// Enable or disable recording future conversions. Existing entries are preserved.
-    History { value: HistoryPreference },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum HistoryPreference {
-    On,
-    Off,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum ConversionOutcome {
-    Stored(HistoryEntry),
-    Rejected {
-        input_path: String,
-        status: &'static str,
-        error: String,
-    },
-}
-
-impl ConversionOutcome {
-    fn is_success(&self) -> bool {
-        matches!(self, Self::Stored(entry) if entry.status == "success")
-    }
-}
-
-#[derive(Serialize)]
-struct BatchReport {
-    succeeded: usize,
-    failed: usize,
-    results: Vec<ConversionOutcome>,
-}
+/// Set by the Ctrl-C handler so interrupted prompts can wait for its notice.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> ExitCode {
+    install_interrupt_handler();
     match run(Cli::parse()) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
+        Ok(code) => code,
         Err(error) => {
-            eprintln!("error: {error:#}");
-            ExitCode::from(1)
+            if error.downcast_ref::<ui::Cancelled>().is_some() {
+                ui::eprint_line(&ui::cancelled_note());
+                ExitCode::from(EXIT_INTERRUPTED)
+            } else if is_interrupted_read(&error) {
+                // Let the Ctrl-C handler print the cancellation notice before
+                // this thread tears the process down.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                while !INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                ExitCode::from(EXIT_INTERRUPTED)
+            } else {
+                ui::eprint_line(&format!("{} {:#}", ui::error_label(), error));
+                ExitCode::from(1)
+            }
         }
     }
 }
 
-fn run(cli: Cli) -> Result<bool> {
+/// True when an interactive read was aborted by Ctrl-C.
+fn is_interrupted_read(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io.kind() == std::io::ErrorKind::Interrupted
+        } else if let Some(dialoguer::Error::IO(io)) = cause.downcast_ref::<dialoguer::Error>() {
+            io.kind() == std::io::ErrorKind::Interrupted
+        } else {
+            false
+        }
+    })
+}
+
+fn run(cli: Cli) -> Result<ExitCode> {
+    let Cli {
+        data_dir,
+        accept_terms,
+        verbose,
+        command,
+    } = cli;
+
     // These read-only commands do not need to create a database.
-    if !cli.accept_terms {
-        match &cli.command {
-            Command::Terms { accept: false } => {
-                print_text(TERMS)?;
-                return Ok(true);
-            }
-            Command::Formats { json } => {
-                print_formats(*json)?;
-                return Ok(true);
-            }
+    if !accept_terms {
+        match &command {
+            Some(Command::Terms(args)) if !args.accept => return commands::info::print_terms(),
+            Some(Command::Formats(args)) => return commands::info::formats(args),
             _ => {}
         }
     }
 
-    let data_dir = cli.data_dir.map(Ok).unwrap_or_else(default_data_dir)?;
-    std::fs::create_dir_all(&data_dir)
-        .with_context(|| format!("cannot create data directory {}", data_dir.display()))?;
-    let store = Store::open(data_dir.join("sheetshift.sqlite3"))?;
-    if cli.accept_terms {
+    // A bare invocation opens the interactive menu on a terminal and prints
+    // help with a usage exit code everywhere else.
+    let Some(command) = command else {
+        if ui::interactive() {
+            return menu_flow(data_dir, verbose);
+        }
+        print_help_to_stderr();
+        return Ok(ExitCode::from(EXIT_USAGE));
+    };
+
+    // Fail usage checks before creating any local state.
+    if let Command::Convert(args) = &command {
+        if args.files.is_empty() && (args.json || !ui::interactive()) {
+            commands::convert::print_missing_files_error();
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
+    }
+
+    let store = open_store(data_dir, verbose)?;
+    if accept_terms {
         store.accept_terms()?;
     }
 
-    match cli.command {
-        Command::Convert(args) => convert(&store, args),
-        Command::History(args) => {
-            if args.clear {
-                store.clear_history()?;
-                if args.json {
-                    print_json(&serde_json::json!({ "cleared": true }))?;
-                } else {
-                    print_text("Conversion history cleared. Source and output files were kept.\n")?;
-                }
-            } else {
-                let history = store.history(args.limit as usize)?;
-                if args.json {
-                    print_json(&history)?;
-                } else if history.is_empty() {
-                    print_text("No conversion history.\n")?;
-                } else {
-                    for entry in history {
-                        print_text(&format!(
-                            "{}  {}  {}\n",
-                            entry.created_at, entry.status, entry.input_name
-                        ))?;
-                        if let Some(output) = entry.output_path {
-                            print_text(&format!("  Output: {output}\n"))?;
-                        }
-                        if let Some(error) = entry.error {
-                            print_text(&format!("  Error: {error}\n"))?;
-                        }
-                    }
-                }
-            }
-            Ok(true)
-        }
-        Command::Settings { command } => {
-            let mut settings = store.settings()?;
-            match command {
-                None | Some(SettingsCommand::View) => {}
-                Some(SettingsCommand::OutputDir { directory, reset }) => {
-                    settings.output_directory = if reset {
-                        None
-                    } else {
-                        directory.map(absolute_path_string).transpose()?
-                    };
-                    store.save_settings(&settings)?;
-                }
-                Some(SettingsCommand::History { value }) => {
-                    settings.remember_history = matches!(value, HistoryPreference::On);
-                    store.save_settings(&settings)?;
-                }
-            }
-            print_json(&settings)?;
-            Ok(true)
-        }
-        Command::Terms { accept } => {
-            if accept {
-                store.accept_terms()?;
-                print_text(&format!(
-                    "Accepted SheetShift terms version {TERMS_VERSION}.\n"
-                ))?;
-            } else {
-                print_text(TERMS)?;
-            }
-            Ok(true)
-        }
-        Command::Formats { json } => {
-            print_formats(json)?;
-            Ok(true)
-        }
+    match command {
+        Command::Convert(args) => commands::convert::run(&store, args, verbose),
+        Command::History(args) => commands::history::run(&store, args, verbose),
+        Command::Settings { command } => commands::settings::run(&store, command, verbose),
+        Command::Terms(args) if args.accept => commands::info::accept_terms(&store),
+        Command::Terms(_) => commands::info::print_terms(),
+        Command::Formats(args) => commands::info::formats(&args),
     }
 }
 
-fn convert(store: &Store, args: ConvertArgs) -> Result<bool> {
-    let settings = store.settings()?;
-    // Preparation failures become ordinary batch results, keeping --json useful
-    // even when a destination is unwritable. Do not create files before consent.
-    let output_directory = resolve_output_directory(args.output, &settings)
-        .and_then(|directory| {
-            if settings.accepted_terms_version.as_deref() == Some(TERMS_VERSION) {
-                std::fs::create_dir_all(&directory).with_context(|| {
-                    format!("cannot create output folder {directory}; choose a writable directory")
-                })?;
-            }
-            Ok(directory)
-        })
-        .map_err(|error| format!("{error:#}"));
-    let mut results = Vec::with_capacity(args.files.len());
+fn open_store(data_dir: Option<PathBuf>, verbose: bool) -> Result<Store> {
+    let data_dir = data_dir.map(Ok).unwrap_or_else(default_data_dir)?;
+    ui::verbose_log(verbose, format!("data directory: {}", data_dir.display()));
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("cannot create data directory {}", data_dir.display()))?;
+    Store::open(data_dir.join("sheetshift.sqlite3"))
+}
 
-    for file in args.files {
-        let source_label = file.to_string_lossy().into_owned();
-        let result = match &output_directory {
-            Ok(output_directory) => absolute_path_string(file).and_then(|input_path| {
-                store.convert(&ConversionRequest {
-                    input_path,
-                    output_directory: output_directory.clone(),
-                })
-            }),
-            Err(error) => Err(anyhow::anyhow!(error.clone())),
-        };
-        let outcome = match result {
-            Ok(entry) => ConversionOutcome::Stored(entry),
-            Err(error) => ConversionOutcome::Rejected {
-                input_path: source_label,
-                status: "failed",
-                error: format!("{error:#}"),
-            },
-        };
-        if !args.json {
-            print_outcome(&outcome)?;
+/// Main menu flow for the bare `sheetshift` invocation on a terminal.
+fn menu_flow(data_dir: Option<PathBuf>, verbose: bool) -> Result<ExitCode> {
+    ui::print_text(&ui::banner())?;
+    match prompts::main_menu()? {
+        prompts::MainMenu::Convert => {
+            let store = open_store(data_dir, verbose)?;
+            commands::convert::run(
+                &store,
+                ConvertArgs {
+                    files: Vec::new(),
+                    output: None,
+                    json: false,
+                },
+                verbose,
+            )
         }
-        results.push(outcome);
-    }
-
-    let succeeded = results.iter().filter(|entry| entry.is_success()).count();
-    let report = BatchReport {
-        succeeded,
-        failed: results.len() - succeeded,
-        results,
-    };
-    if args.json {
-        print_json(&report)?;
-    } else {
-        print_text(&format!(
-            "\n{} converted, {} failed.\n",
-            report.succeeded, report.failed
-        ))?;
-    }
-    Ok(report.failed == 0)
-}
-
-fn resolve_output_directory(explicit: Option<PathBuf>, settings: &Settings) -> Result<String> {
-    let output = explicit
-        .or_else(|| settings.output_directory.as_ref().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("converted"));
-    absolute_path_string(output)
-}
-
-fn absolute_path_string(path: PathBuf) -> Result<String> {
-    let absolute = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .context("cannot determine current working directory")?
-            .join(path)
-    };
-    match absolute.to_str() {
-        Some(path) => Ok(path.to_owned()),
-        None => bail!("file paths must be valid Unicode: {}", absolute.display()),
-    }
-}
-
-fn print_outcome(outcome: &ConversionOutcome) -> Result<()> {
-    match outcome {
-        ConversionOutcome::Stored(entry) => {
-            if entry.status == "success" {
-                print_text(&format!(
-                    "Converted {} → {} ({} rows, {} sheets)\n",
-                    entry.input_name,
-                    entry.output_path.as_deref().unwrap_or("unknown output"),
-                    entry.rows,
-                    entry.sheets
-                ))?;
-            } else {
-                print_text(&format!(
-                    "Failed {}: {}\n",
-                    entry.input_name,
-                    entry.error.as_deref().unwrap_or("conversion failed")
-                ))?;
-            }
-            for warning in &entry.warnings {
-                print_text(&format!("  Warning: {warning}\n"))?;
-            }
+        prompts::MainMenu::History => {
+            let store = open_store(data_dir, verbose)?;
+            commands::history::run(
+                &store,
+                HistoryArgs {
+                    limit: 50,
+                    json: false,
+                    clear: false,
+                    yes: false,
+                },
+                verbose,
+            )
         }
-        ConversionOutcome::Rejected {
-            input_path, error, ..
-        } => print_text(&format!("Failed {input_path}: {error}\n"))?,
-    }
-    Ok(())
-}
-
-fn print_formats(json: bool) -> Result<()> {
-    let formats = supported_formats();
-    if json {
-        print_json(&formats)
-    } else {
-        print_text(&format!(
-            "Supported input formats: {}\n",
-            formats.join(", ")
-        ))
+        prompts::MainMenu::Settings => {
+            let store = open_store(data_dir, verbose)?;
+            commands::settings::run(&store, None, verbose)
+        }
+        prompts::MainMenu::Terms => commands::info::print_terms(),
+        prompts::MainMenu::Formats => commands::info::formats(&FormatsArgs { json: false }),
+        prompts::MainMenu::Exit => Ok(ExitCode::SUCCESS),
     }
 }
 
-fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    serde_json::to_writer_pretty(&mut output, value).context("cannot write JSON output")?;
-    writeln!(output).context("cannot write output")?;
-    Ok(())
+fn print_help_to_stderr() {
+    let help = Cli::command().render_help();
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{help}");
+    let _ = stderr.flush();
 }
 
-fn print_text(value: &str) -> Result<()> {
-    std::io::stdout()
-        .lock()
-        .write_all(value.as_bytes())
-        .context("cannot write output")
+/// Restore the cursor and leave cleanly on Ctrl-C instead of a stack trace.
+fn install_interrupt_handler() {
+    let _ = ctrlc::set_handler(|| {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let term = console::Term::stderr();
+        let _ = term.show_cursor();
+        let _ = term.write_line("");
+        let _ = term.write_line(&ui::cancelled_note());
+        std::process::exit(i32::from(EXIT_INTERRUPTED));
+    });
 }
 
 #[cfg(test)]
@@ -371,9 +224,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clearing_history_requires_explicit_acknowledgement() {
-        assert!(Cli::try_parse_from(["sheetshift", "history", "--clear"]).is_err());
-        assert!(Cli::try_parse_from(["sheetshift", "history", "--yes"]).is_err());
+    fn bare_invocation_parses_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["sheetshift"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn clearing_history_flags_parse_and_are_validated_at_runtime() {
+        assert!(Cli::try_parse_from(["sheetshift", "history", "--clear"]).is_ok());
         assert!(Cli::try_parse_from(["sheetshift", "history", "--clear", "--yes"]).is_ok());
     }
 
@@ -395,7 +254,7 @@ mod tests {
         assert!(cli.accept_terms);
         assert_eq!(cli.data_dir, Some(PathBuf::from("state")));
         match cli.command {
-            Command::Convert(args) => {
+            Some(Command::Convert(args)) => {
                 assert_eq!(args.files.len(), 2);
                 assert!(args.json);
                 assert_eq!(args.output, Some(PathBuf::from("results")));
@@ -405,8 +264,8 @@ mod tests {
     }
 
     #[test]
-    fn output_setting_requires_a_path_or_reset_and_disallows_both() {
-        assert!(Cli::try_parse_from(["sheetshift", "settings", "output-dir"]).is_err());
+    fn output_setting_disallows_a_path_together_with_reset() {
+        assert!(Cli::try_parse_from(["sheetshift", "settings", "output-dir"]).is_ok());
         assert!(Cli::try_parse_from(["sheetshift", "settings", "output-dir", "--reset"]).is_ok());
         assert!(Cli::try_parse_from([
             "sheetshift",
@@ -422,5 +281,12 @@ mod tests {
     fn history_limit_is_bounded() {
         assert!(Cli::try_parse_from(["sheetshift", "history", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from(["sheetshift", "history", "--limit", "1001"]).is_err());
+    }
+
+    #[test]
+    fn verbose_flag_is_global() {
+        assert!(Cli::try_parse_from(["sheetshift", "-v", "formats"]).is_ok());
+        assert!(Cli::try_parse_from(["sheetshift", "formats", "--verbose"]).is_ok());
+        assert!(Cli::try_parse_from(["sheetshift", "history", "-v"]).is_ok());
     }
 }

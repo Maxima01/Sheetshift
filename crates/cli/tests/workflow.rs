@@ -169,3 +169,75 @@ fn invalid_output_directory_is_reported_as_clean_json() {
         .unwrap()
         .contains("output folder"));
 }
+
+#[test]
+fn bare_invocation_prints_help_with_usage_exit_code() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("state");
+    let output = cli(&data, &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Usage:"), "stderr={stderr}");
+    assert!(stderr.contains("sheetshift"));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !data.exists(),
+        "bare invocation must not create local state"
+    );
+}
+
+#[test]
+fn convert_without_files_is_a_usage_error_when_not_interactive() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("state");
+    let output = cli(&data, &["convert"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sheetshift convert"));
+    assert!(!data.exists(), "usage errors must not create local state");
+
+    let as_json = cli(&data, &["convert", "--json"]);
+    assert_eq!(as_json.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&as_json.stderr).contains("sheetshift convert"));
+}
+
+#[test]
+fn verbose_diagnostics_go_to_stderr_and_json_stays_clean() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("state");
+    let input = temp.path().join("notes.txt");
+    let output_dir = temp.path().join("out");
+    std::fs::write(&input, "First line\nSecond line\n").unwrap();
+    let output = cli(
+        &data,
+        &[
+            "convert",
+            input.to_str().unwrap(),
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--accept-terms",
+            "--json",
+            "--verbose",
+        ],
+    );
+    assert!(output.status.success());
+    assert_eq!(json(&output)["succeeded"], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("data directory:"), "stderr={stderr}");
+}
+
+#[test]
+fn settings_and_history_missing_arguments_are_usage_errors() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("state");
+
+    let output_dir = cli(&data, &["settings", "output-dir"]);
+    assert_eq!(output_dir.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output_dir.stderr).contains("output-dir"));
+
+    let history_setting = cli(&data, &["settings", "history"]);
+    assert_eq!(history_setting.status.code(), Some(2));
+
+    let yes_without_clear = cli(&data, &["history", "--yes"]);
+    assert_eq!(yes_without_clear.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&yes_without_clear.stderr).contains("--clear"));
+}

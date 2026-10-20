@@ -11,7 +11,11 @@ SheetShift separates interface concerns from document conversion. The desktop ap
 | `crates/core/src/lib.rs` | Public request/result/settings types, supported formats, data directory, and terms version |
 | `crates/core/src/conversion.rs` | Input parsing, worksheet construction, conversion limits, and XLSX output |
 | `crates/core/src/store.rs` | SQLite settings/history, terms gating, failure recording, and retention |
-| `crates/cli/src/main.rs` | Clap commands, batch orchestration, text/JSON output, and process exit status |
+| `crates/cli/src/main.rs` | Clap entry point, interactive menu flow, interrupt handling, and process exit status |
+| `crates/cli/src/ui.rs` | Terminal capability detection, shared theme helpers, tables, and JSON/plain print helpers |
+| `crates/cli/src/prompts.rs` | Main menu, confirmations, and the fuzzy multi-select file picker |
+| `crates/cli/src/progress.rs` | Spinner and batch progress bars for interactive conversions |
+| `crates/cli/src/commands/` | Convert, history, settings, terms, and formats subcommand implementations |
 | `crates/cli/tests/workflow.rs` | Executable-level CLI tests using temporary profiles and files |
 | `docs/TERMS.md` | Shared human-readable terms source |
 | `docs/GAPS.md` | Documented limitations and prioritized improvements |

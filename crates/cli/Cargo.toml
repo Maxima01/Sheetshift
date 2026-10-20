@@ -10,10 +10,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
+console = "0.15"
+ctrlc = "3"
+dialoguer = { version = "0.12", default-features = false }
+fuzzy-matcher = "0.3"
+indicatif = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sheetshift-core = { path = "../core" }
+tabled = { version = "0.22", features = ["ansi"] }
 
 [dev-dependencies]
 tempfile = "3"

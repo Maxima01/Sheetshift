@@ -29,6 +29,10 @@ pub struct ConvertArgs {
     /// Write a single JSON object to stdout; errors still cause a nonzero exit.
     #[arg(long)]
     pub json: bool,
+
+    /// Keep all source styling, merges, formulas, and embedded content for unchanged .xlsx files.
+    #[arg(long)]
+    pub preserve_formatting: bool,
 }
 
 #[derive(Serialize)]
@@ -160,6 +164,7 @@ pub fn run(store: &Store, args: ConvertArgs, verbose: bool) -> Result<ExitCode> 
                 store.convert(&ConversionRequest {
                     input_path,
                     output_directory: output_directory.clone(),
+                    preserve_formatting: args.preserve_formatting,
                 })
             }),
             Err(error) => Err(anyhow::anyhow!(error.clone())),

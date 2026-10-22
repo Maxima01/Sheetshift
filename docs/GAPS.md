@@ -15,6 +15,10 @@ This document distinguishes implemented safeguards from remaining work. The curr
 | Terms present only as a UI checkbox | The Rust core checks versioned acceptance for every conversion. |
 | Theme disconnected from user preference | Appearance follows the operating-system theme. |
 | Browser preview implying conversion support | Preview shows its native-runtime limitation and does not fabricate saved history. |
+| No review before workbook creation | The desktop can preview every supported format, edit visible cells and worksheet names, and rejects export if the source changed after review. |
+| PDF work always scans all page text | Manual review extracts only selected pages and uses the same structure-first parser as automatic mode. Both join fragmented cell borders and reconstruct ruled tables before trying spacing heuristics. |
+| Text-layer PDFs producing one word per spreadsheet row | Horizontal glyphs are grouped by visible baseline and spacing, so text output uses visual rows. When no table is found, automatic review shows those rows instead of an empty result. |
+| XLSX formatting always lost | Opt-in Format Protection copies an unchanged `.xlsx` workbook package, retaining merges, styles, formulas, links, and embedded content. |
 
 ## Prioritized improvements
 
@@ -26,7 +30,7 @@ Acceptance criterion: the application remains responsive and can recover after a
 
 ### 2. Improve text extraction fidelity with representative fixtures
 
-PDF text order is determined by the source's text layer. Multiple columns, unusual encodings, rotated text, and positioned glyphs may extract poorly. DOCX body paragraphs and tables do not imply full support for footnotes, headers, text boxes, comments, or tracked changes. Define a fixture corpus with expected content and document the behavior for each feature.
+PDF text rows now use character coordinates rather than the PDF text-operation order. Multiple columns, unusual encodings, overprinted labels, and irregular baselines can still extract poorly. Rotated or diagonal text is excluded from horizontal rows with a warning. DOCX body paragraphs and tables do not imply full support for footnotes, headers, text boxes, comments, or tracked changes. Expand the fixture corpus with representative source files and expected content for each feature.
 
 Acceptance criterion: regression tests detect missing text and ordering changes across dependency updates, and the UI reports known omissions in a useful way.
 
@@ -36,11 +40,11 @@ Image-only PDFs currently cannot become useful text rows. An OCR backend would a
 
 Acceptance criterion: users can distinguish extracted text from OCR text, review low-confidence results, and use the application without the optional OCR dependency.
 
-### 4. Offer preview and mapping before writing
+### 4. Extend preview mapping and borderless PDF table recognition
 
-The current workflow applies a defined representation for each format. Add a small row preview, delimiter/encoding selection for text, and optional column mapping for JSON. A separate table-extraction mode could later interpret structured PDFs without changing the predictable text-to-rows default.
+The current workflow provides a bounded editable row preview, worksheet renaming, PDF page selection, ruled-table reconstruction from local geometry, and a spacing-based fallback. Add delimiter/encoding selection for text, optional column mapping for JSON, structural row/column operations, merged-cell review, and stronger recognition for borderless tables or several unrelated tables on one page. Columns that existed only in the source authoring file but are absent from the PDF cannot be inferred reliably.
 
-Acceptance criterion: the preview matches the eventual output and explicit choices are included in the conversion history.
+Acceptance criterion: users can fix column structure as well as cell text, and review choices are summarized in conversion history without storing source content.
 
 ### 5. Add progress and true cancellation
 
@@ -50,7 +54,7 @@ Acceptance criterion: cancel leaves no completed-looking partial file and identi
 
 ### 6. Extend compatibility deliberately
 
-Legacy `.doc`, `.rtf`, and password-protected files need additional parsers or a clearly managed external converter. Spreadsheet formulas currently become cached values where available; macros, charts, merged-cell semantics, and styling are not retained. Add targeted support only after defining fidelity and security expectations.
+Legacy `.doc`, `.rtf`, and password-protected files need additional parsers or a clearly managed external converter. Normalized spreadsheet conversion uses cached formula values where available and loses macros, charts, merges, and styling. Format Protection retains these for unchanged `.xlsx` files by copying the original package; it cannot apply reviewed edits or rename sheets, and does not support `.xls`, `.xlsb`, `.xlsm`, or `.ods`. PDF and DOCX output cannot reconstruct source visual styling or merges reliably. Add targeted support only after defining fidelity and security expectations.
 
 Acceptance criterion: each new advertised format has success, failure, and fidelity tests, and missing optional dependencies have actionable errors.
 

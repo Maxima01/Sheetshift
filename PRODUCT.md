@@ -24,6 +24,9 @@ The user confirmed general document text into rows as the primary use case. Peop
 
 - Input formats: DOCX, PDF, XLSX, XLS, XLSB, XLSM, ODS, CSV, TSV, TXT, and JSON.
 - Output format: XLSX. Extraction is best effort; source structure and supported format determine fidelity.
+- Every supported input can be previewed before export; previewed cell values and worksheet names can be corrected.
+- PDF review supports one-based page ranges and local table reconstruction from selectable text positions and ruled cell borders, with spacing heuristics as a fallback. Text without a detected table is grouped into visual rows. Page selection avoids extracting unrequested pages.
+- Format Protection can retain merges, styling, formulas, links, and embedded content for an unchanged `.xlsx` source. Reviewed cell edits and worksheet renaming require normalized output instead.
 - The desktop and CLI share a Rust conversion engine and local persistence.
 - History and settings are local. The user can disable future history and clear saved history.
 - Terms must be accepted before conversion.
@@ -33,7 +36,7 @@ The user confirmed general document text into rows as the primary use case. Peop
 
 ## Product Principles
 
-1. Show exactly what will be converted and where it will be saved.
+1. Show exactly what will be converted, let the user correct it, and show where it will be saved.
 2. Expose individual failures and extraction warnings alongside successful results.
 3. Keep routine workflows local and predictable.
 4. Make native file selection and keyboard operation first-class.

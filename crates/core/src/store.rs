@@ -1,4 +1,6 @@
-use crate::{conversion, ConversionRequest, HistoryEntry, Settings, TERMS_VERSION};
+use crate::{
+    conversion, ConversionRequest, HistoryEntry, ReviewedConversionRequest, Settings, TERMS_VERSION,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -176,6 +178,63 @@ impl Store {
         // Third-party parsers should return errors, but protect the application from
         // unwind panics caused by malformed input. This is not a resource sandbox.
         match std::panic::catch_unwind(|| conversion::convert(request)) {
+            Ok(Ok(result)) => {
+                entry.status = "success".to_owned();
+                entry.output_path = Some(result.output_path.to_string_lossy().into_owned());
+                entry.rows = result.rows;
+                entry.sheets = result.sheets;
+                entry.warnings = result.warnings;
+            }
+            Ok(Err(error)) => entry.error = Some(format!("{error:#}")),
+            Err(_) => entry.error = Some("The document parser could not safely read this file. Re-export it from its original application and try again.".to_owned()),
+        }
+        entry.duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if settings.remember_history {
+            self.record(&entry).with_context(|| {
+                if let Some(output) = &entry.output_path {
+                    format!(
+                        "Workbook created at {output}, but its history record could not be saved"
+                    )
+                } else {
+                    "Conversion failed and its history record could not be saved".to_owned()
+                }
+            })?;
+        }
+        Ok(entry)
+    }
+
+    /// Converts a document using the options and cell corrections confirmed in preview.
+    pub fn convert_reviewed(&self, request: &ReviewedConversionRequest) -> Result<HistoryEntry> {
+        let settings = self.settings()?;
+        if settings.accepted_terms_version.as_deref() != Some(TERMS_VERSION) {
+            bail!("Please review and accept the current terms ({TERMS_VERSION}) before converting files.");
+        }
+        let start = Instant::now();
+        let input = Path::new(&request.input_path);
+        let absolute = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+        let mut entry = HistoryEntry {
+            id: Uuid::new_v4().to_string(),
+            input_name: input
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            input_path: absolute.to_string_lossy().into_owned(),
+            output_path: None,
+            format: input
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+            status: "failed".to_owned(),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            rows: 0,
+            sheets: 0,
+            duration_ms: 0,
+            warnings: Vec::new(),
+            error: None,
+        };
+        match std::panic::catch_unwind(|| conversion::convert_reviewed(request)) {
             Ok(Ok(result)) => {
                 entry.status = "success".to_owned();
                 entry.output_path = Some(result.output_path.to_string_lossy().into_owned());

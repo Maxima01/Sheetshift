@@ -1,5 +1,8 @@
 //! Thin desktop adapter. Conversion and persistence live in sheetshift-core.
-use sheetshift_core::{ConversionRequest, HistoryEntry, Settings, Store};
+use sheetshift_core::{
+    CellEdit, ConversionPreview, ConversionRequest, HistoryEntry, PdfReviewOptions, PreviewRequest,
+    ReviewedConversionRequest, Settings, Store,
+};
 use std::{
     collections::HashSet,
     path::PathBuf,
@@ -18,6 +21,45 @@ struct DesktopState {
 struct DesktopConversionRequest {
     input_path: String,
     output_directory: Option<String>,
+    #[serde(default)]
+    preserve_formatting: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct DesktopReviewedConversionRequest {
+    input_path: String,
+    output_directory: Option<String>,
+    source_fingerprint: String,
+    #[serde(default)]
+    pdf_options: PdfReviewOptions,
+    #[serde(default)]
+    edits: Vec<CellEdit>,
+    #[serde(default)]
+    sheet_names: Vec<String>,
+    #[serde(default)]
+    preserve_formatting: bool,
+}
+
+impl DesktopReviewedConversionRequest {
+    fn into_core(self) -> ReviewedConversionRequest {
+        let output_directory = self.output_directory.unwrap_or_else(|| {
+            std::path::Path::new(&self.input_path)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_string_lossy()
+                .into_owned()
+        });
+        ReviewedConversionRequest {
+            input_path: self.input_path,
+            output_directory,
+            source_fingerprint: self.source_fingerprint,
+            pdf_options: self.pdf_options,
+            edits: self.edits,
+            sheet_names: self.sheet_names,
+            preserve_formatting: self.preserve_formatting,
+        }
+    }
 }
 
 impl DesktopConversionRequest {
@@ -33,6 +75,7 @@ impl DesktopConversionRequest {
         ConversionRequest {
             input_path: self.input_path,
             output_directory,
+            preserve_formatting: self.preserve_formatting,
         }
     }
 }
@@ -88,6 +131,38 @@ async fn convert_file(
     let request = request.into_core();
     // Parsing is CPU/disk intensive: never block Tauri's UI thread.
     let entry = tauri::async_runtime::spawn_blocking(move || store.convert(&request))
+        .await
+        .map_err(message)?
+        .map_err(message)?;
+    if let Some(path) = &entry.output_path {
+        if entry.status == "success" {
+            let canonical = std::fs::canonicalize(path).map_err(message)?;
+            state
+                .session_outputs
+                .lock()
+                .map_err(message)?
+                .insert(canonical);
+        }
+    }
+    Ok(entry)
+}
+
+#[tauri::command]
+async fn preview_file(request: PreviewRequest) -> Result<ConversionPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || sheetshift_core::preview_file(&request))
+        .await
+        .map_err(message)?
+        .map_err(message)
+}
+
+#[tauri::command]
+async fn convert_reviewed_file(
+    request: DesktopReviewedConversionRequest,
+    state: State<'_, DesktopState>,
+) -> Result<HistoryEntry, String> {
+    let store = Arc::clone(&state.store);
+    let request = request.into_core();
+    let entry = tauri::async_runtime::spawn_blocking(move || store.convert_reviewed(&request))
         .await
         .map_err(message)?
         .map_err(message)?;
@@ -168,7 +243,9 @@ pub fn run() {
             clear_history,
             accept_terms,
             get_supported_formats,
+            preview_file,
             convert_file,
+            convert_reviewed_file,
             open_output
         ])
         .run(tauri::generate_context!())

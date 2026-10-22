@@ -173,6 +173,7 @@ fn menu_flow(data_dir: Option<PathBuf>, verbose: bool) -> Result<ExitCode> {
                     files: Vec::new(),
                     output: None,
                     json: false,
+                    preserve_formatting: false,
                 },
                 verbose,
             )

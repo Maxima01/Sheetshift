@@ -9,7 +9,8 @@ SheetShift separates interface concerns from document conversion. The desktop ap
 | `src/` | React and TypeScript desktop interface, view state, styling, and Tauri IPC calls |
 | `src-tauri/` | Tauri application manifest, window configuration, capabilities, Rust command adapters, and native output opening |
 | `crates/core/src/lib.rs` | Public request/result/settings types, supported formats, data directory, and terms version |
-| `crates/core/src/conversion.rs` | Input parsing, worksheet construction, conversion limits, and XLSX output |
+| `crates/core/src/conversion.rs` | Shared conversion coordination, validation, preview/review handling, and XLSX output |
+| `crates/core/src/conversion/pdf.rs` | PDF page extraction, text positioning, table detection, mixed-content rows, and PDF warnings |
 | `crates/core/src/store.rs` | SQLite settings/history, terms gating, failure recording, and retention |
 | `crates/cli/src/main.rs` | Clap entry point, interactive menu flow, interrupt handling, and process exit status |
 | `crates/cli/src/ui.rs` | Terminal capability detection, shared theme helpers, tables, and JSON/plain print helpers |
@@ -25,19 +26,20 @@ The root Cargo workspace includes `sheetshift-core`, `sheetshift-cli`, and `shee
 ## Conversion flow
 
 1. The interface collects input paths and a destination. The CLI processes files sequentially and continues after individual failures.
-2. `Store::convert(&ConversionRequest)` loads preferences and requires `accepted_terms_version` to match `TERMS_VERSION`.
-3. The conversion engine validates the local input and selects its parser by extension. It extracts document text or structured data into workbook rows.
-4. The writer creates an XLSX file in the destination without overwriting an existing file. It returns row counts, sheet counts, and warnings describing relevant losses.
-5. The store creates a `HistoryEntry` with status `success` or `failed`. When enabled, it records that entry and trims history to the latest 1,000 attempts.
-6. The interface shows the result and warnings. The CLI also reflects batch failure in its exit status.
+2. The desktop can call `preview_file(&PreviewRequest)`. The engine parses locally and returns a bounded view of the eventual sheets plus a source SHA-256. The PDF node either extracts only a requested page set or reconstructs ruled tables from positioned text and drawing commands, with a spacing-based fallback. Paragraph rows around detected tables remain in reading order. Text without a detected table is grouped by visible baseline into rows.
+3. The review grid records sparse cell corrections and worksheet-name changes. It does not store a second copy of the whole document.
+4. `Store::convert_reviewed(&ReviewedConversionRequest)` verifies that the source fingerprint still matches, re-runs the same parser/options, and applies those corrections. The CLI continues to use `Store::convert(&ConversionRequest)` directly.
+5. Both conversion paths require `accepted_terms_version` to match `TERMS_VERSION`. Preview itself does not create a workbook or history record.
+6. The writer creates an XLSX file in the destination without overwriting an existing file. It returns row counts, sheet counts, and warnings describing relevant losses. Opt-in Format Protection copies an unchanged `.xlsx` package after parsing and validation, retaining its native workbook features.
+7. The store creates a `HistoryEntry` with status `success` or `failed`. When enabled, it records that entry and trims history to the latest 1,000 attempts.
 
-The core catches unwind panics from third-party parsers and turns them into conversion errors. That protects normal control flow; it does not provide process isolation, prevent allocation failures, or impose a timeout. Terms and database errors return `Err`. Ordinary parser/file failures return `Ok(HistoryEntry)` with `status == "failed"`, allowing batch callers to continue.
+The core catches unwind panics from third-party parsers and turns them into conversion errors. The PDF node is a code boundary within the core process; it does not provide process isolation, prevent allocation failures, or impose a timeout. Terms and database errors return `Err`. Ordinary parser/file failures return `Ok(HistoryEntry)` with `status == "failed"`, allowing batch callers to continue.
 
 If workbook creation succeeds but saving history fails, the error includes the created workbook path. Callers should not interpret that error as proof that no file was created.
 
 ## Shared public types
 
-`ConversionRequest` contains `input_path` and `output_directory`, both strings. Interfaces resolve user-selected paths; the core performs file validation and conversion. Rust callers can use relative paths, resolved by their process working directory. The CLI converts paths to absolute Unicode strings before calling the core.
+`ConversionRequest` contains `input_path`, `output_directory`, and `preserve_formatting`. `PreviewRequest`, `ConversionPreview`, and `ReviewedConversionRequest` carry PDF review options, bounded sheet data, the source fingerprint, and sparse corrections for the desktop review flow. Reviewed Format Protection rejects cell corrections and sheet renames, because the original XLSX package is copied unchanged. Interfaces resolve user-selected paths; the core performs file validation and conversion. Rust callers can use relative paths, resolved by their process working directory. The CLI converts paths to absolute Unicode strings before calling the core.
 
 The desktop IPC accepts a nullable destination through `DesktopConversionRequest`. A null destination resolves to the source file's parent folder before calling the core. The CLI instead defaults to `./converted` when no destination preference is saved.
 
@@ -78,7 +80,7 @@ Keep parsing off the UI thread when adding commands. A future cancellation featu
 
 ## Format adapters
 
-The core uses `calamine` for spreadsheet input, `pdf-extract` for PDF text, XML/ZIP parsing for DOCX, `csv` for delimited data, `serde_json` for JSON, and `rust_xlsxwriter` for XLSX output. Format support means the documented data extraction is supported, not every feature of a format.
+The core uses `calamine` for spreadsheet input, `pdf-extract`/`lopdf` for PDF text positions, drawing commands, and selected-page access, XML/ZIP parsing for DOCX, `csv` for delimited data, `serde_json` for JSON, and `rust_xlsxwriter` for normalized XLSX output. PDF extraction now lives in `conversion/pdf.rs`, called by the shared coordinator for both preview and conversion. Ruled PDF tables are reconstructed from character coordinates and horizontal/vertical cell borders; simple borderless tables fall back to spacing/pipe/tab heuristics. Surrounding selectable text is kept as rows. This is local geometry extraction, not OCR. Format support means the documented data extraction is supported, not every feature of a format.
 
 When adding a format:
 
@@ -93,7 +95,7 @@ When adding a format:
 
 The Rust process reads the files supplied by the user and writes to the selected destination with that user's operating-system permissions. The document parsers operate in-process. Tauri's webview permissions do not sandbox the Rust parser or restrict it to a disposable process.
 
-Source content should never be executed as macros, scripts, shell commands, or spreadsheet formulas. Outputs are data-only workbooks. Filesystem paths are data; use structured native APIs for opening files instead of concatenating shell command strings.
+The conversion process does not execute source macros, scripts, shell commands, or spreadsheet formulas. Normalized outputs are data-only workbooks. Format Protection is different: it copies the original `.xlsx` bytes and therefore retains formulas, links, and any embedded content already in the source. Filesystem paths are data; use structured native APIs for opening files instead of concatenating shell command strings.
 
 Database contents include potentially sensitive paths and errors. Neither the metadata database nor generated workbooks are encrypted by the application. Do not add telemetry, remote uploads, background synchronization, or source-content logging without an explicit product and privacy decision.
 

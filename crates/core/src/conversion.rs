@@ -1,9 +1,13 @@
-use crate::{supported_formats, ConversionRequest};
+use crate::{
+    supported_formats, ConversionPreview, ConversionRequest, PdfReviewMode, PdfReviewOptions,
+    PreviewCell, PreviewRequest, PreviewSheet, ReviewedConversionRequest,
+};
 use anyhow::{bail, ensure, Context, Result};
 use calamine::{open_workbook_auto_from_rs, Data, Reader};
 use roxmltree::Node;
-use rust_xlsxwriter::Workbook;
+use rust_xlsxwriter::{Format, FormatAlign, Workbook};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -12,6 +16,8 @@ use std::{
 };
 use tempfile::NamedTempFile;
 use zip::ZipArchive;
+
+mod pdf;
 
 // These limits reject oversized work instead of silently truncating documents.
 const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
@@ -22,6 +28,9 @@ const MAX_ROWS: usize = 100_000;
 const MAX_COLUMNS: usize = 16_384;
 const MAX_SHEETS: usize = 128;
 const MAX_CELL_CHARS: usize = 32_767;
+const PREVIEW_ROW_LIMIT: usize = 150;
+const PREVIEW_COLUMN_LIMIT: usize = 50;
+const MAX_REVIEW_EDITS: usize = 10_000;
 
 pub(crate) struct ConversionResult {
     pub output_path: PathBuf,
@@ -41,6 +50,20 @@ enum Cell {
 struct Sheet {
     name: String,
     rows: Vec<Vec<Cell>>,
+}
+
+struct LoadedInput {
+    source: PathBuf,
+    extension: String,
+    bytes: Vec<u8>,
+}
+
+struct ParsedDocument {
+    sheets: Vec<Sheet>,
+    warnings: Vec<String>,
+    page_count: Option<u32>,
+    selected_pages: Vec<u32>,
+    detected_tables: usize,
 }
 
 impl Sheet {
@@ -70,16 +93,9 @@ impl Sheet {
     }
 }
 
-pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
-    ensure!(
-        !request.input_path.trim().is_empty(),
-        "Choose a source file."
-    );
-    ensure!(
-        !request.output_directory.trim().is_empty(),
-        "Choose an output folder."
-    );
-    let source = Path::new(&request.input_path);
+fn load_input(input_path: &str) -> Result<LoadedInput> {
+    ensure!(!input_path.trim().is_empty(), "Choose a source file.");
+    let source = Path::new(input_path);
     let extension = source
         .extension()
         .unwrap_or_default()
@@ -107,16 +123,6 @@ pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
         "The source grew beyond the 50 MiB file limit while reading."
     );
     ensure!(!bytes.is_empty(), "The source file is empty.");
-    let output_dir = Path::new(&request.output_directory)
-        .canonicalize()
-        .context(
-            "The output folder does not exist or cannot be accessed. Choose an existing folder.",
-        )?;
-    ensure!(
-        output_dir.is_dir(),
-        "The output path must be an existing folder."
-    );
-
     if matches!(
         extension.as_str(),
         "docx" | "xlsx" | "xlsm" | "xlsb" | "ods"
@@ -124,19 +130,53 @@ pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
     {
         validate_zip(&bytes)?;
     }
+    Ok(LoadedInput {
+        source: source.to_path_buf(),
+        extension,
+        bytes,
+    })
+}
+
+fn parse_input(
+    input: &LoadedInput,
+    pdf_options: Option<&PdfReviewOptions>,
+) -> Result<ParsedDocument> {
     let mut warnings = Vec::new();
-    let sheets = match extension.as_str() {
-        "docx" => parse_docx(&bytes, &mut warnings)?,
-        "pdf" => parse_pdf(&bytes, &mut warnings)?,
-        "csv" => parse_delimited(&bytes, b',')?,
-        "tsv" => parse_delimited(&bytes, b'\t')?,
-        "txt" => parse_text(&bytes)?,
-        "json" => parse_json(&bytes)?,
-        _ => parse_workbook(&bytes, &mut warnings)?,
+    let mut page_count = None;
+    let mut selected_pages = Vec::new();
+    let mut detected_tables = 0;
+    let sheets = match input.extension.as_str() {
+        "docx" => parse_docx(&input.bytes, &mut warnings)?,
+        "pdf" => {
+            if let Some(options) = pdf_options {
+                let parsed = pdf::parse_for_review(&input.bytes, options, &mut warnings)?;
+                page_count = Some(parsed.page_count);
+                selected_pages = parsed.included_pages;
+                detected_tables = parsed.detected_tables;
+                parsed.sheets
+            } else {
+                pdf::parse(&input.bytes, &mut warnings)?
+            }
+        }
+        "csv" => parse_delimited(&input.bytes, b',')?,
+        "tsv" => parse_delimited(&input.bytes, b'\t')?,
+        "txt" => parse_text(&input.bytes)?,
+        "json" => parse_json(&input.bytes)?,
+        _ => parse_workbook(&input.bytes, &mut warnings)?,
     };
+    Ok(ParsedDocument {
+        sheets,
+        warnings,
+        page_count,
+        selected_pages,
+        detected_tables,
+    })
+}
+
+fn validate_sheets(sheets: &[Sheet]) -> Result<()> {
     ensure!(
         !sheets.is_empty(),
-        "No readable worksheets or text were found."
+        "No content is ready to export. Adjust the page selection or switch extraction mode, then preview again."
     );
     ensure!(
         sheets.len() <= MAX_SHEETS,
@@ -146,6 +186,186 @@ pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
         sheets.iter().any(|s| !s.rows.is_empty()),
         "The source has no readable rows."
     );
+    Ok(())
+}
+
+fn output_directory(path: &str) -> Result<PathBuf> {
+    ensure!(!path.trim().is_empty(), "Choose an output folder.");
+    let output_dir = Path::new(path).canonicalize().context(
+        "The output folder does not exist or cannot be accessed. Choose an existing folder.",
+    )?;
+    ensure!(
+        output_dir.is_dir(),
+        "The output path must be an existing folder."
+    );
+    Ok(output_dir)
+}
+
+pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
+    let input = load_input(&request.input_path)?;
+    let mut parsed = parse_input(&input, None)?;
+    validate_sheets(&parsed.sheets)?;
+    let output_dir = output_directory(&request.output_directory)?;
+    if request.preserve_formatting {
+        ensure!(
+            input.extension == "xlsx",
+            "Format Protection currently supports unchanged .xlsx files only."
+        );
+        parsed.warnings.clear();
+        return preserve_xlsx(&input, &output_dir, &parsed.sheets, parsed.warnings);
+    }
+    write_workbook(
+        &input.source,
+        &input.extension,
+        &output_dir,
+        parsed.sheets,
+        parsed.warnings,
+    )
+}
+
+pub(crate) fn preview(request: &PreviewRequest) -> Result<ConversionPreview> {
+    let input = load_input(&request.input_path)?;
+    let parsed = parse_input(&input, Some(&request.pdf_options))?;
+    if input.extension != "pdf" || request.pdf_options.mode == PdfReviewMode::SelectedPages {
+        validate_sheets(&parsed.sheets)?;
+    }
+    let sheets = parsed
+        .sheets
+        .iter()
+        .map(|sheet| {
+            let total_columns = sheet.rows.iter().map(Vec::len).max().unwrap_or(0);
+            let rows = sheet
+                .rows
+                .iter()
+                .take(PREVIEW_ROW_LIMIT)
+                .map(|row| {
+                    row.iter()
+                        .take(PREVIEW_COLUMN_LIMIT)
+                        .map(|cell| match cell {
+                            Cell::Text(value) => PreviewCell::Text(value.clone()),
+                            Cell::Number(value) => PreviewCell::Number(*value),
+                            Cell::Boolean(value) => PreviewCell::Boolean(*value),
+                            Cell::Empty => PreviewCell::Empty,
+                        })
+                        .collect()
+                })
+                .collect();
+            PreviewSheet {
+                name: sheet.name.clone(),
+                rows,
+                total_rows: sheet.rows.len(),
+                total_columns,
+                truncated: sheet.rows.len() > PREVIEW_ROW_LIMIT
+                    || total_columns > PREVIEW_COLUMN_LIMIT,
+            }
+        })
+        .collect();
+    Ok(ConversionPreview {
+        input_name: input
+            .source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        format: input.extension,
+        source_fingerprint: format!("{:x}", Sha256::digest(&input.bytes)),
+        page_count: parsed.page_count,
+        selected_pages: parsed.selected_pages,
+        detected_tables: parsed.detected_tables,
+        sheets,
+        warnings: parsed.warnings,
+    })
+}
+
+pub(crate) fn convert_reviewed(request: &ReviewedConversionRequest) -> Result<ConversionResult> {
+    ensure!(
+        request.edits.len() <= MAX_REVIEW_EDITS,
+        "The review contains too many cell edits (limit: 10,000)."
+    );
+    let input = load_input(&request.input_path)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&input.bytes)) == request.source_fingerprint,
+        "The source changed after it was previewed. Generate a fresh preview before converting."
+    );
+    let mut parsed = parse_input(&input, Some(&request.pdf_options))?;
+    validate_sheets(&parsed.sheets)?;
+    if request.preserve_formatting {
+        ensure!(
+            input.extension == "xlsx",
+            "Format Protection currently supports unchanged .xlsx files only."
+        );
+        ensure!(request.edits.is_empty(), "Format Protection cannot be combined with cell corrections. Turn it off to export edited values.");
+        ensure!(
+            request.sheet_names.is_empty()
+                || (request.sheet_names.len() == parsed.sheets.len()
+                    && request.sheet_names.iter().zip(&parsed.sheets).all(|(name, sheet)| name == &sheet.name)),
+            "Format Protection cannot be combined with worksheet renaming. Turn it off to export renamed sheets."
+        );
+        let output_dir = output_directory(&request.output_directory)?;
+        parsed.warnings.clear();
+        return preserve_xlsx(&input, &output_dir, &parsed.sheets, parsed.warnings);
+    }
+    let mut renamed_sheets = 0usize;
+    for (index, name) in request.sheet_names.iter().enumerate() {
+        if let Some(sheet) = parsed.sheets.get_mut(index) {
+            let name = name.trim();
+            ensure!(!name.is_empty(), "Worksheet names cannot be empty.");
+            if sheet.name != name {
+                renamed_sheets += 1;
+            }
+            sheet.name = name.to_owned();
+        }
+    }
+    for edit in &request.edits {
+        let sheet = parsed
+            .sheets
+            .get_mut(edit.sheet_index)
+            .context("A reviewed worksheet no longer exists. Preview the file again.")?;
+        let row = sheet
+            .rows
+            .get_mut(edit.row_index)
+            .context("A reviewed row no longer exists. Preview the file again.")?;
+        ensure!(
+            edit.column_index < row.len(),
+            "A reviewed column no longer exists. Preview the file again."
+        );
+        ensure!(
+            edit.value.chars().count() <= MAX_CELL_CHARS,
+            "A reviewed cell exceeds Excel's 32,767-character limit."
+        );
+        row[edit.column_index] = Cell::Text(edit.value.clone());
+    }
+    if !request.edits.is_empty() {
+        parsed.warnings.push(format!(
+            "Applied {} reviewed cell correction{} before export.",
+            request.edits.len(),
+            if request.edits.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if renamed_sheets > 0 {
+        parsed.warnings.push(format!(
+            "Applied {renamed_sheets} reviewed worksheet name change{} before export.",
+            if renamed_sheets == 1 { "" } else { "s" }
+        ));
+    }
+    let output_dir = output_directory(&request.output_directory)?;
+    write_workbook(
+        &input.source,
+        &input.extension,
+        &output_dir,
+        parsed.sheets,
+        parsed.warnings,
+    )
+}
+
+fn write_workbook(
+    source: &Path,
+    extension: &str,
+    output_dir: &Path,
+    sheets: Vec<Sheet>,
+    warnings: Vec<String>,
+) -> Result<ConversionResult> {
+    validate_sheets(&sheets)?;
 
     let rows = sheets.iter().map(|s| s.rows.len() as u64).sum();
     let sheet_count = sheets.len() as u32;
@@ -154,6 +374,17 @@ pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
     for (index, sheet) in sheets.into_iter().enumerate() {
         let worksheet = workbook.add_worksheet();
         worksheet.set_name(safe_sheet_name(&sheet.name, index, &mut names))?;
+        let is_pdf_text_rows = extension == "pdf"
+            && matches!(
+                sheet.rows.first().map(Vec::as_slice),
+                Some([
+                    Cell::Text(page),
+                    Cell::Text(line),
+                    Cell::Text(text)
+                ]) if page == "Page" && line == "Line" && text == "Text"
+            );
+        let is_pdf_table = extension == "pdf" && !is_pdf_text_rows;
+        let pdf_table_format = Format::new().set_text_wrap().set_align(FormatAlign::Top);
         // Estimate widths with bounded work and a sensible cap. General text
         // should be readable immediately, especially PDF's third text column.
         let mut widths = Vec::<usize>::new();
@@ -175,24 +406,58 @@ pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
                 widths[column] = widths[column].max(length.saturating_add(2).min(90));
             }
         }
+        if is_pdf_text_rows {
+            widths = vec![8, 8, 90];
+        } else if is_pdf_table && widths.len() >= 3 {
+            let last = widths.len() - 1;
+            widths[0] = widths[0].clamp(8, 14);
+            for width in &mut widths[1..last] {
+                *width = (*width).clamp(24, 90);
+            }
+            widths[last] = widths[last].clamp(16, 30);
+        } else if matches!(extension, "docx" | "txt") {
+            if let Some(width) = widths.first_mut() {
+                *width = (*width).max(60);
+            }
+        }
+        // Height estimation below must use the widths actually written to Excel.
         for (column, width) in widths.iter().enumerate() {
             worksheet.set_column_width(column as u16, *width as f64)?;
         }
-        if extension == "pdf" {
-            worksheet.set_column_width(0, 8)?;
-            worksheet.set_column_width(1, 8)?;
-            worksheet.set_column_width(2, 90)?;
-        } else if matches!(extension.as_str(), "docx" | "txt") {
-            worksheet.set_column_width(0, widths.first().copied().unwrap_or(60).max(60) as f64)?;
-        }
         for (row_index, row) in sheet.rows.into_iter().enumerate() {
+            if is_pdf_table {
+                let estimated_lines = row
+                    .iter()
+                    .enumerate()
+                    .map(|(column, cell)| match cell {
+                        Cell::Text(text) => {
+                            let width = widths.get(column).copied().unwrap_or(20).clamp(8, 90);
+                            text.lines()
+                                .map(|line| line.chars().count().div_ceil(width).max(1))
+                                .sum::<usize>()
+                        }
+                        _ => 1,
+                    })
+                    .max()
+                    .unwrap_or(1);
+                if estimated_lines > 1 {
+                    worksheet.set_row_height(
+                        row_index as u32,
+                        (estimated_lines as f64 * 15.0).clamp(15.0, 409.0),
+                    )?;
+                }
+            }
             for (column_index, cell) in row.into_iter().enumerate() {
                 let r = row_index as u32;
                 let c = column_index as u16;
                 match cell {
                     // Explicit strings prevent formula or URL auto-detection.
                     Cell::Text(text) => {
-                        worksheet.write_string(r, c, &text)?;
+                        if is_pdf_table {
+                            worksheet.write_string_with_format(r, c, &text, &pdf_table_format)?;
+                        } else {
+                            worksheet.write_string(r, c, &text)?;
+                        }
                     }
                     Cell::Number(number) if number.is_finite() => {
                         worksheet.write_number(r, c, number)?;
@@ -211,10 +476,38 @@ pub(crate) fn convert(request: &ConversionRequest) -> Result<ConversionResult> {
     let buffer = workbook
         .save_to_buffer()
         .context("Could not create the Excel workbook")?;
-    let mut temporary = NamedTempFile::new_in(&output_dir)
+    persist_workbook(source, output_dir, &buffer, rows, sheet_count, warnings)
+}
+
+fn preserve_xlsx(
+    input: &LoadedInput,
+    output_dir: &Path,
+    sheets: &[Sheet],
+    mut warnings: Vec<String>,
+) -> Result<ConversionResult> {
+    warnings.push("Format Protection copied the original XLSX package, preserving merged cells, styling, formulas, links, and embedded content. Cell corrections and worksheet renaming were not applied.".to_owned());
+    persist_workbook(
+        &input.source,
+        output_dir,
+        &input.bytes,
+        sheets.iter().map(|sheet| sheet.rows.len() as u64).sum(),
+        sheets.len() as u32,
+        warnings,
+    )
+}
+
+fn persist_workbook(
+    source: &Path,
+    output_dir: &Path,
+    buffer: &[u8],
+    rows: u64,
+    sheet_count: u32,
+    warnings: Vec<String>,
+) -> Result<ConversionResult> {
+    let mut temporary = NamedTempFile::new_in(output_dir)
         .context("Could not create a file in the output folder. Check its write permissions and available disk space")?;
     temporary
-        .write_all(&buffer)
+        .write_all(buffer)
         .context("Could not write the workbook. Check available disk space")?;
     temporary.as_file().sync_all()?;
     let stem = safe_file_stem(
@@ -337,43 +630,6 @@ fn parse_text(bytes: &[u8]) -> Result<Vec<Sheet>> {
     let mut cells = 0;
     for line in text.lines() {
         sheet.push(vec![Cell::Text(line.to_owned())], &mut cells)?;
-    }
-    Ok(vec![sheet])
-}
-
-fn parse_pdf(bytes: &[u8], warnings: &mut Vec<String>) -> Result<Vec<Sheet>> {
-    let pages = pdf_extract::extract_text_from_mem_by_pages(bytes)
-        .context("Could not extract PDF text. The PDF may be encrypted, corrupt, or unsupported; try re-exporting an unencrypted PDF")?;
-    ensure!(pages.iter().any(|page| !page.trim().is_empty()),
-        "No selectable text was found in this PDF. Scanned/image-only PDFs require OCR, which this version does not include.");
-    warnings.push("PDF text is extracted into Page, Line, and Text columns. Reading order may differ from the visual layout; tables, images, handwriting, and scanned pages are not reconstructed. Review the workbook against the source.".to_owned());
-    let mut sheet = Sheet::new("Document");
-    let mut cells = 0;
-    sheet.push(
-        vec![
-            Cell::Text("Page".to_owned()),
-            Cell::Text("Line".to_owned()),
-            Cell::Text("Text".to_owned()),
-        ],
-        &mut cells,
-    )?;
-    for (page_index, page) in pages.iter().enumerate() {
-        if page.trim().is_empty() {
-            warnings.push(format!(
-                "Page {} has no extractable text and may contain an image or scan.",
-                page_index + 1
-            ));
-        }
-        for (line_index, line) in page.lines().enumerate() {
-            sheet.push(
-                vec![
-                    Cell::Number((page_index + 1) as f64),
-                    Cell::Number((line_index + 1) as f64),
-                    Cell::Text(line.to_owned()),
-                ],
-                &mut cells,
-            )?;
-        }
     }
     Ok(vec![sheet])
 }
